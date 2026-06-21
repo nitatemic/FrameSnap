@@ -81,17 +81,33 @@ npm install
 
 ### 2. Lancer le serveur de développement
 
+FrameSnap est disponible en deux versions : **Web** (classique) et **Bureau** (application native via Electron).
+
+**Pour la version Web :**
 ```bash
 npm run dev
 ```
 L'application sera lancée localement sur [http://localhost:5173/](http://localhost:5173/).
 
+**Pour la version Bureau :**
+```bash
+npm run dev:desktop
+```
+Le serveur web démarrera et la fenêtre native de l'application de bureau Electron s'ouvrira automatiquement.
+
 ### 3. Compiler pour la production
 
+**Pour déployer le site web :**
 ```bash
 npm run build
 ```
 Les fichiers statiques seront générés dans le dossier `/dist`.
+
+**Pour compiler l'application de bureau (Installateurs Mac, Windows et Linux) :**
+```bash
+npm run build:desktop
+```
+Les exécutables finaux (`.dmg`, `.exe`, `.deb`, etc.) seront générés dans le dossier `/release`. L'application embarque le navigateur Chromium pour garantir que WebAssembly et les en-têtes Cross-Origin nécessaires à `ffmpeg.wasm` soient parfaitement supportés.
 
 ---
 
