@@ -130,6 +130,37 @@ FrameSnap respecte entièrement votre vie privée. **Aucune donnée vidéo n'est
 
 ---
 
+## 📱 API Serverless & Raccourci iOS (Auto-hébergement)
+
+FrameSnap dispose d'un backend Serverless léger intégré (`api/extract.js`) permettant de traiter une vidéo en arrière-plan sans ouvrir le navigateur, ce qui est idéal pour l'utiliser avec un **Raccourci iOS**.
+
+### 1. Hébergement (Scaleway Serverless Containers)
+
+Pour contourner la limite de 10 secondes de Vercel et utiliser le binaire système de FFmpeg, l'API est conçue pour tourner sur **Scaleway Serverless Containers** (qui offre 15 minutes de temps d'exécution et un quota gratuit très généreux). L'API se trouve dans le dossier `server/`.
+
+1. Créez un compte sur [Scaleway](https://www.scaleway.com/).
+2. Dans la console Scaleway, allez dans **Serverless > Containers** et créez un nouveau conteneur.
+3. Déployez l'image Docker contenue dans le dossier `server/` (soit via le CLI Scaleway, soit en liant votre registre de conteneurs).
+4. Définissez le port d'écoute sur **8080**.
+5. **Sécurité :** Dans les variables d'environnement du conteneur (Environment Variables), ajoutez une clé `API_SECRET_TOKEN` avec un mot de passe fort de votre choix. L'API rejettera les requêtes sans ce mot de passe.
+
+*Note : Scaleway mettra le conteneur en veille (scale to zero) s'il n'est pas utilisé. Le premier appel mettra 1 à 3 secondes pour réveiller le conteneur.*
+
+### 2. Configuration du Raccourci iOS
+
+1. Créez un nouveau raccourci iOS et activez **"Dans la feuille de partage"** (Accepter : Multimédia/Vidéos).
+2. Ajoutez l'action **"Obtenir le contenu de l'URL"** :
+   - **URL :** `https://<VOTRE-DOMAINE>/api/extract`
+   - **Méthode :** `POST`
+   - **En-têtes :** Ajoutez un en-tête avec Clé `Authorization` et Texte `Bearer VOTRE_MOT_DE_PASSE_SECRET`.
+   - **Corps de la requête :** `Formulaire`
+   - **Nouveau champ :** Type `Fichier`, Clé `video`, Fichier `Entrée du raccourci` (Variable magique).
+3. Ajoutez l'action **"Enregistrer dans l'album photo"** et liez-la au contenu renvoyé par l'URL.
+
+Vous pouvez désormais partager une vidéo depuis l'app Photos vers ce raccourci, et l'image extraite s'enregistrera automatiquement dans votre pellicule !
+
+---
+
 ## 📄 Licence
 
 Ce projet est sous licence MIT. Voir le fichier [LICENSE](LICENSE) pour plus de détails.
