@@ -132,32 +132,39 @@ FrameSnap respecte entièrement votre vie privée. **Aucune donnée vidéo n'est
 
 ## 📱 API Serverless & Raccourci iOS (Auto-hébergement)
 
-FrameSnap dispose d'un backend Serverless léger intégré (`api/extract.js`) permettant de traiter une vidéo en arrière-plan sans ouvrir le navigateur, ce qui est idéal pour l'utiliser avec un **Raccourci iOS**.
+FrameSnap dispose d'un backend Serverless (`server/index.js`) permettant de traiter une vidéo en arrière-plan sans charger WebAssembly. Le front-end web peut également s'y connecter pour déléguer l'extraction lourde au serveur !
 
-### 1. Hébergement (Scaleway Serverless Containers)
+L'API supporte deux modes de fonctionnement :
+- **Mode `best` (par défaut)** : Extrait automatiquement la "meilleure" I-frame (vers 20% de la vidéo) et renvoie une simple image JPEG. Idéal pour un Raccourci iOS ou un usage scripté rapide.
+- **Mode `gallery`** : Extrait toutes les I-frames demandées (avec les mêmes options avancées que le web : `method`, `limit`, `scale`, `format`), et renvoie un fichier `.zip` contenant la galerie. Le front-end s'en sert pour afficher l'interface complète.
 
-Pour contourner la limite de 10 secondes de Vercel et utiliser le binaire système de FFmpeg, l'API est conçue pour tourner sur **Scaleway Serverless Containers** (qui offre 15 minutes de temps d'exécution et un quota gratuit très généreux). L'API se trouve dans le dossier `server/`.
+### 1. Hébergement (Docker / Scaleway Serverless)
 
-1. Créez un compte sur [Scaleway](https://www.scaleway.com/).
-2. Dans la console Scaleway, allez dans **Serverless > Containers** et créez un nouveau conteneur.
-3. Déployez l'image Docker contenue dans le dossier `server/` (soit via le CLI Scaleway, soit en liant votre registre de conteneurs).
-4. Définissez le port d'écoute sur **8080**.
-5. **Sécurité :** Dans les variables d'environnement du conteneur (Environment Variables), ajoutez une clé `API_SECRET_TOKEN` avec un mot de passe fort de votre choix. L'API rejettera les requêtes sans ce mot de passe.
+L'API est packagée dans un conteneur Docker léger basé sur Node.js et un binaire système FFmpeg natif.
 
-*Note : Scaleway mettra le conteneur en veille (scale to zero) s'il n'est pas utilisé. Le premier appel mettra 1 à 3 secondes pour réveiller le conteneur.*
+1. Déployez l'image Docker contenue dans le dossier `server/` (ex: sur Scaleway Serverless Containers).
+2. Définissez le port d'écoute sur **8080**.
+3. **Sécurité (Variables d'environnement) :**
+   - Ajoutez une clé `API_SECRET_TOKEN` avec un mot de passe fort. L'API rejettera les requêtes sans ce mot de passe.
+   - Si vous êtes sur un réseau local sécurisé ou que vous ne voulez pas d'authentification, vous pouvez désactiver la sécurité en définissant la variable `AUTH=non`.
 
-### 2. Configuration du Raccourci iOS
+### 2. Utilisation depuis l'interface Web FrameSnap
+
+Dans FrameSnap, ouvrez le panneau **"Réglages Avancés"** et cochez **"Utiliser l'API Distante (Docker)"**.
+Renseignez l'URL de votre conteneur (ex: `https://votre-domaine/api/extract`) et votre jeton secret. Le traitement s'effectuera désormais sur le serveur au lieu de votre navigateur !
+
+### 3. Configuration d'un Raccourci iOS (Extraction rapide)
 
 1. Créez un nouveau raccourci iOS et activez **"Dans la feuille de partage"** (Accepter : Multimédia/Vidéos).
 2. Ajoutez l'action **"Obtenir le contenu de l'URL"** :
    - **URL :** `https://<VOTRE-DOMAINE>/api/extract`
    - **Méthode :** `POST`
-   - **En-têtes :** Ajoutez un en-tête avec Clé `Authorization` et Texte `Bearer VOTRE_MOT_DE_PASSE_SECRET`.
+   - **En-têtes :** Ajoutez un en-tête avec Clé `Authorization` et Texte `Bearer VOTRE_MOT_DE_PASSE_SECRET` (inutile si `AUTH=non`).
    - **Corps de la requête :** `Formulaire`
    - **Nouveau champ :** Type `Fichier`, Clé `video`, Fichier `Entrée du raccourci` (Variable magique).
 3. Ajoutez l'action **"Enregistrer dans l'album photo"** et liez-la au contenu renvoyé par l'URL.
 
-Vous pouvez désormais partager une vidéo depuis l'app Photos vers ce raccourci, et l'image extraite s'enregistrera automatiquement dans votre pellicule !
+Vous pouvez désormais partager une vidéo depuis l'app Photos vers ce raccourci, et la "meilleure" image extraite s'enregistrera automatiquement dans votre pellicule !
 
 ---
 

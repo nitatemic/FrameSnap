@@ -110,6 +110,11 @@ function App() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [galleryFilter, setGalleryFilter] = useState('all'); // all, unique, duplicates
   
+  // API Mode States
+  const [useApiMode, setUseApiMode] = useState(false);
+  const [apiUrl, setApiUrl] = useState('http://localhost:8080/api/extract');
+  const [apiToken, setApiToken] = useState('');
+
   // Advanced Settings States
   const [extractionLimit, setExtractionLimit] = useState(30);
   const [exportFormat, setExportFormat] = useState('png');
@@ -284,6 +289,98 @@ function App() {
     };
 
     try {
+      if (useApiMode) {
+        // API Extraction branch
+        updateStep('load', 'completed');
+        updateStep('write', 'completed');
+        updateStep('exec', 'active');
+        
+        const formData = new FormData();
+        formData.append('video', videoFile);
+        formData.append('mode', 'gallery');
+        formData.append('method', extractionMethod);
+        formData.append('limit', String(extractionLimit));
+        formData.append('scale', scaleResolution);
+        formData.append('format', exportFormat);
+        formData.append('quality', String(exportQuality));
+
+        const headers = {};
+        if (apiToken) {
+          headers['Authorization'] = `Bearer ${apiToken}`;
+        }
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers,
+          body: formData
+        });
+
+        if (!response.ok) {
+          throw new Error(`Erreur API: ${response.status} ${response.statusText}`);
+        }
+
+        const blob = await response.blob();
+        
+        updateStep('exec', 'completed');
+        updateStep('read', 'active');
+        
+        const JSZip = (await import('jszip')).default;
+        const zip = await JSZip.loadAsync(blob);
+        
+        let i = 1;
+        const loadedFrames = [];
+        
+        for (const [filename, fileData] of Object.entries(zip.files)) {
+          if (!fileData.dir) {
+            const data = await fileData.async('uint8array');
+            const mimeType = exportFormat === 'png' ? 'image/png' : 'image/jpeg';
+            const imgBlob = new Blob([data.buffer], { type: mimeType });
+            const url = URL.createObjectURL(imgBlob);
+            
+            loadedFrames.push({
+              id: i,
+              name: filename,
+              url,
+              blob: imgBlob,
+              size: data.length,
+              timestamp: i, // Fallback timestamp since API doesn't parse it yet
+              resolution: videoMeta ? videoMeta.resolution : 'Originale',
+              isDuplicate: false,
+              duplicateOf: null,
+              difference: 0
+            });
+            i++;
+          }
+        }
+        
+        updateStep('read', 'completed');
+        updateStep('dedup', 'active');
+        
+        if (loadedFrames.length === 0) {
+          setErrorMessage("L'API n'a renvoyé aucune image. Vérifiez les options d'extraction.");
+          setProcessing(false);
+          updateStep('dedup', 'error');
+          return;
+        }
+        
+        // Compute visual similarity fingerprints
+        const framesWithFingerprints = [];
+        for (let fIdx = 0; fIdx < loadedFrames.length; fIdx++) {
+          const frame = loadedFrames[fIdx];
+          setProgress(Math.round((fIdx / loadedFrames.length) * 100));
+          const fingerprint = await getVisualFingerprint(frame.url);
+          framesWithFingerprints.push({
+            ...frame,
+            fingerprint
+          });
+        }
+        
+        setRawFrames(framesWithFingerprints);
+        updateStep('dedup', 'completed');
+        setProcessing(false);
+        return;
+      }
+
       // Step 1: Init Engine
       let ffmpeg = ffmpegInstance.current;
       if (!ffmpegLoaded || !ffmpeg) {
@@ -716,6 +813,47 @@ function App() {
             {advancedOpen && (
               <div className="animate-fade-in" style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 
+                {/* API Mode Toggle */}
+                <div className="form-group" style={{ backgroundColor: 'var(--bg-secondary)', padding: '12px', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+                  <label className="form-checkbox-label" style={{ fontWeight: '600', marginBottom: useApiMode ? '12px' : '0' }}>
+                    <input
+                      type="checkbox"
+                      className="form-checkbox"
+                      checked={useApiMode}
+                      onChange={(e) => setUseApiMode(e.target.checked)}
+                      disabled={processing}
+                    />
+                    Utiliser l'API Distante (Docker)
+                  </label>
+                  
+                  {useApiMode && (
+                    <div className="animate-fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <div className="form-group" style={{ marginBottom: '0' }}>
+                        <label className="form-label" style={{ fontSize: '0.75rem' }}>URL de l'API</label>
+                        <input
+                          type="text"
+                          className="form-select"
+                          value={apiUrl}
+                          onChange={(e) => setApiUrl(e.target.value)}
+                          disabled={processing}
+                          placeholder="http://localhost:8080/api/extract"
+                        />
+                      </div>
+                      <div className="form-group" style={{ marginBottom: '0' }}>
+                        <label className="form-label" style={{ fontSize: '0.75rem' }}>Jeton d'authentification (Optionnel)</label>
+                        <input
+                          type="password"
+                          className="form-select"
+                          value={apiToken}
+                          onChange={(e) => setApiToken(e.target.value)}
+                          disabled={processing}
+                          placeholder="Votre API_SECRET_TOKEN"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 {/* Method */}
                 <div className="form-group">
                   <label className="form-label">

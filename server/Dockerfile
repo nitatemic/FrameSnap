@@ -14,6 +14,9 @@ RUN npm install --production
 # Copier le reste des fichiers du serveur
 COPY . .
 
+# Option d'authentification (mettre AUTH=non pour désactiver)
+ENV AUTH=""
+
 # Scaleway Serverless Containers écoute par défaut sur le port 8080
 ENV PORT=8080
 EXPOSE 8080
