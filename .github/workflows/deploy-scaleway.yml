@@ -36,6 +36,6 @@ jobs:
           context: ./server
           push: true
           # Remplacez "VOTRE_NAMESPACE" par le nom de votre namespace Scaleway
-          tags: rg.fr-par.scw.cloud/VOTRE_NAMESPACE/framesnap-api:latest
+          tags: rg.fr-par.scw.cloud/nitatemic/framesnap-api:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
