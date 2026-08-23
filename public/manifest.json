@@ -1,7 +1,7 @@
 {
   "short_name": "FrameSnap",
-  "name": "FrameSnap - FFmpeg Keyframe Extractor",
-  "description": "Extraire de vraies I-frames et keyframes localement dans le navigateur avec FFmpeg WebAssembly.",
+  "name": "FrameSnap - FFmpeg Sharp Frame Extractor",
+  "description": "Extraire automatiquement les images les plus nettes localement dans le navigateur avec FFmpeg WebAssembly.",
   "icons": [
     {
       "src": "favicon.svg",

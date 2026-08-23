@@ -561,7 +561,7 @@ body {
   background-color: var(--success);
 }
 
-/* I-frame list / gallery */
+/* Frame list / gallery */
 .gallery-section {
   display: flex;
   flex-direction: column;
