@@ -1,6 +1,6 @@
 # 🎥 FrameSnap
 
-> **Extracteur de véritables I-frames (keyframes) local, ultra-précis et performant, propulsé par FFmpeg en WebAssembly directement dans votre navigateur.**
+> **Extracteur d'images nettes local, ultra-précis et performant, propulsé par FFmpeg en WebAssembly directement dans votre navigateur.**
 
 [![Vite](https://img.shields.io/badge/Vite-8.x-purple?style=flat-square&logo=vite)](https://vite.dev/)
 [![React](https://img.shields.io/badge/React-19.x-blue?style=flat-square&logo=react)](https://react.dev/)
@@ -12,9 +12,9 @@
 
 ## 📖 À propos
 
-**FrameSnap** est une application web moderne de traitement vidéo côté client conçue pour extraire les **vraies trames clés (I-frames / keyframes)** de fichiers vidéo sans jamais les uploader sur un serveur externe. 
+**FrameSnap** est une application web moderne de traitement vidéo côté client conçue pour extraire automatiquement les **images les plus nettes** de fichiers vidéo sans jamais les uploader sur un serveur externe. 
 
-Contrairement aux outils de capture HTML5 classiques qui se contentent de capturer une image décodée à un instant donné (souvent sujette à du flou de mouvement ou des approximations temporelles), FrameSnap interroge la structure physique du codec vidéo à l'aide de **FFmpeg exécuté dans le navigateur via WebAssembly**.
+Contrairement aux outils de capture HTML5 classiques qui se contentent de capturer une image décodée à un instant donné (souvent sujette à du flou de mouvement ou des approximations temporelles), FrameSnap s'appuie sur le filtre `thumbnail` de **FFmpeg exécuté dans le navigateur via WebAssembly** pour analyser chaque fenêtre temporelle et ne conserver que la frame la plus représentative.
 
 Il a été développé avec une attention rigoureuse apportée aux détails : esthétique haut de gamme, mode sombre natif, déduplication intelligente et ergonomie pensée pour l'usage mobile (PWA).
 
@@ -22,16 +22,21 @@ Il a été développé avec une attention rigoureuse apportée aux détails : es
 
 ## ✨ Fonctionnalités clés
 
-* **Extraction physique avec FFmpeg.wasm** : Écriture de la vidéo dans un système de fichiers virtuel WebAssembly, décodage précis, extraction native des I-frames et suppression automatique des fichiers temporaires pour économiser la mémoire.
+* **Extraction par netteté avec FFmpeg.wasm** : Écriture de la vidéo dans un système de fichiers virtuel WebAssembly, sélection de la meilleure frame par lot via le filtre `thumbnail`, puis suppression automatique des fichiers temporaires pour économiser la mémoire.
+* **Deux modes d'extraction** :
+  * *Mode Rapide* : échantillonnage à 1 fps et comparaison par petits lots (`fps=1,thumbnail=2`), une seule passe sur les vidéos courtes (≤ 120 s).
+  * *Mode Détaillé* : taille de lot adaptée au framerate réel détecté automatiquement, traitement segmenté avec purge mémoire après chaque segment.
 * **Extraction des métadonnées originales** : Analyse en temps réel des logs FFmpeg via le filtre `showinfo` pour extraire les timestamps exacts (`pts_time`), la résolution originale et la position dans le flux de données.
 * **Déduplication visuelle intelligente** : 
   * Analyse de similarité instantanée en générant une empreinte couleur RGB de 16x16 sur canvas.
-  * Calcul de la distance RMS (Root Mean Square) en millisecondes pour repérer les doublons.
+  * Calcul de la distance RMS (Root Mean Square) en pourcentage pour repérer les doublons.
   * Masquage ou regroupement dynamique des frames redondantes à l'aide d'un curseur de sensibilité ajustable.
+* **Score de netteté par image** : Chaque frame extraite est analysée (variance du filtre laplacien sur une copie en niveaux de gris) et reçoit un score consultable dans les métadonnées, utilisable comme critère de tri de la galerie.
+* **Détection automatique du framerate** : La cadence réelle de la vidéo (24/25/30/60 fps…) est extraite des logs FFmpeg lors de la sonde initiale et affichée dans les métadonnées.
 * **Recommandation intelligente de frame** : Idéal pour les vidéos de type Story Instagram ou statuts sociaux (image fixe + musique). L'application identifie automatiquement la première frame de la plus longue portion statique de la vidéo et la recommande avec un badge.
 * **Panneau de configuration avancé** :
-  * Trois méthodes d'extraction : *Combinée* (rapide et précise), *Ultra Rapide* (skip_frame nokey), *Précise* (select pict_type).
-  * Limiteur de trames pour les longues vidéos.
+  * Choix du mode d'extraction (Rapide / Détaillé) et taille des segments réglable (5 à 15 s).
+  * Limiteur d'images pour les longues vidéos.
   * Choix du format de sortie (PNG sans perte / JPEG compressé) et curseur de qualité JPEG.
   * Mise à l'échelle de l'export (100% / 50% / 25%) garantissant des dimensions paires compatibles.
 * **PWA Installable & Hors-ligne** : Support complet pour l'écran d'accueil mobile, gestion des zones de sécurité tactiles, thèmes clair et sombre synchronisés, et stockage de cache local (Service Worker).
@@ -42,18 +47,30 @@ Il a été développé avec une attention rigoureuse apportée aux détails : es
 
 ### 1. Logique d'extraction FFmpeg
 
-L'application orchestre les appels WASM en assemblant dynamiquement la commande suivante selon les réglages choisis par l'utilisateur :
+Avant toute extraction, une passe de sonde (`ffmpeg -i input.mp4`, sans fichier de sortie) fait afficher à FFmpeg ses métadonnées de flux : le framerate réel et la durée sont extraits des logs.
+
+Selon le mode choisi, l'application assemble dynamiquement l'une des commandes suivantes :
+
+**Mode Rapide (vidéo ≤ 120 s, une seule passe) :**
 
 ```bash
-ffmpeg -skip_frame nokey -i input.mp4 -vf "select='eq(pict_type,I)',scale=iw/2:-2,showinfo" -an -vsync vfr out_%d.png
+ffmpeg -i input.mp4 -vf "fps=1,scale=iw/2:-2,thumbnail=2,showinfo" -an -vsync vfr out_%d.png
 ```
 
-* `-skip_frame nokey` : Demande au décodeur d'ignorer les trames B et P dès la lecture du flux (gain de vitesse allant jusqu'à 50x).
-* `select='eq(pict_type,I)'` : Conserve uniquement les images clés complètes de type I (Intra-coded).
+**Mode Détaillé (traitement segmenté, ici segment n° 3) :**
+
+```bash
+ffmpeg -ss 20.000 -t 10.000 -i input.mp4 -vf "scale=iw/2:-2,thumbnail=60,showinfo" -an -vsync vfr out_%d.png
+```
+
+* `fps=1` : normalise le flux à 1 image par seconde avant comparaison (le résultat est donc indépendant du framerate source).
+* `thumbnail=N` : met en concurrence les N frames consécutives et ne garde que la plus représentative (la plus nette). En Mode Détaillé, N est calculé comme `fps × 2s` (borné entre 8 et 90) afin que la fenêtre d'analyse reste constante quelle que soit la cadence de la vidéo (24/25/30/60 fps).
+* `-ss ... -t ...` : seek rapide (placé **avant** `-i`) et durée de segment ; la vidéo longue est découpée en segments traités en boucle.
 * `scale=iw/2:-2` : Met à l'échelle la vidéo tout en conservant le ratio d'aspect d'origine et en forçant une hauteur paire (`-2`), évitant les erreurs de décodage FFmpeg.
-* `showinfo` : Logue les informations de trame dans la console WASM (exploité par notre parser de logs).
-* `-an` : Désactive le traitement audio pour accélérer le traitement.
-* `-vsync vfr` : Utilise un framerate variable pour n'exporter que les images sélectionnées par le filtre.
+* `showinfo` : Logue les informations de trame dans la console WASM (exploité par notre parser de logs, avec un offset temporel par segment puisque `-ss` réinitialise `pts_time`).
+* `-an` / `-vsync vfr` : Désactive l'audio et n'exporte que les images sélectionnées par le filtre.
+
+Après chaque segment, les images générées sont lues via `readFile`, converties en blobs, puis supprimées du système de fichiers virtuel via `deleteFile` pour plafonner la consommation RAM.
 
 ### 2. Algorithme de déduplication
 
@@ -127,44 +144,6 @@ Cross-Origin-Embedder-Policy: require-corp
 ## 🛡️ Confidentialité et Sécurité
 
 FrameSnap respecte entièrement votre vie privée. **Aucune donnée vidéo n'est transférée vers un serveur ou un service cloud**. Tout le décodage, l'analyse et la génération d'images sont effectués à 100 % dans le bac à sable (sandbox) WebAssembly de votre propre navigateur.
-
----
-
-## 📱 API Serverless & Raccourci iOS (Auto-hébergement)
-
-FrameSnap dispose d'un backend Serverless (`server/index.js`) permettant de traiter une vidéo en arrière-plan sans charger WebAssembly. Le front-end web peut également s'y connecter pour déléguer l'extraction lourde au serveur !
-
-L'API supporte deux modes de fonctionnement :
-- **Mode `best` (par défaut)** : Extrait automatiquement la "meilleure" I-frame (vers 20% de la vidéo) et renvoie une simple image JPEG. Idéal pour un Raccourci iOS ou un usage scripté rapide.
-- **Mode `gallery`** : Extrait toutes les I-frames demandées (avec les mêmes options avancées que le web : `method`, `limit`, `scale`, `format`), et renvoie un fichier `.zip` contenant la galerie. Le front-end s'en sert pour afficher l'interface complète.
-
-### 1. Hébergement (Docker / Scaleway Serverless)
-
-L'API est packagée dans un conteneur Docker léger basé sur Node.js et un binaire système FFmpeg natif.
-
-1. Déployez l'image Docker contenue dans le dossier `server/` (ex: sur Scaleway Serverless Containers).
-2. Définissez le port d'écoute sur **8080**.
-3. **Sécurité (Variables d'environnement) :**
-   - Ajoutez une clé `API_SECRET_TOKEN` avec un mot de passe fort. L'API rejettera les requêtes sans ce mot de passe.
-   - Si vous êtes sur un réseau local sécurisé ou que vous ne voulez pas d'authentification, vous pouvez désactiver la sécurité en définissant la variable `AUTH=non`.
-
-### 2. Utilisation depuis l'interface Web FrameSnap
-
-Dans FrameSnap, ouvrez le panneau **"Réglages Avancés"** et cochez **"Utiliser l'API Distante (Docker)"**.
-Renseignez l'URL de votre conteneur (ex: `https://votre-domaine/api/extract`) et votre jeton secret. Le traitement s'effectuera désormais sur le serveur au lieu de votre navigateur !
-
-### 3. Configuration d'un Raccourci iOS (Extraction rapide)
-
-1. Créez un nouveau raccourci iOS et activez **"Dans la feuille de partage"** (Accepter : Multimédia/Vidéos).
-2. Ajoutez l'action **"Obtenir le contenu de l'URL"** :
-   - **URL :** `https://<VOTRE-DOMAINE>/api/extract`
-   - **Méthode :** `POST`
-   - **En-têtes :** Ajoutez un en-tête avec Clé `Authorization` et Texte `Bearer VOTRE_MOT_DE_PASSE_SECRET` (inutile si `AUTH=non`).
-   - **Corps de la requête :** `Formulaire`
-   - **Nouveau champ :** Type `Fichier`, Clé `video`, Fichier `Entrée du raccourci` (Variable magique).
-3. Ajoutez l'action **"Enregistrer dans l'album photo"** et liez-la au contenu renvoyé par l'URL.
-
-Vous pouvez désormais partager une vidéo depuis l'app Photos vers ce raccourci, et la "meilleure" image extraite s'enregistrera automatiquement dans votre pellicule !
 
 ---
 

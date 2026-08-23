@@ -478,7 +478,6 @@ body {
   overflow: hidden;
   background-color: #000;
   position: relative;
-  aspect-ratio: 16/9;
 }
 
 .video-preview-card video {
@@ -684,7 +683,7 @@ body {
   align-items: center;
   justify-content: center;
   position: relative;
-  aspect-ratio: 16/9;
+  aspect-ratio: 16 / 9;
   min-height: 240px;
 }
 
@@ -749,6 +748,60 @@ body {
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.75rem;
+}
+
+/* Extraction Mode Selector */
+.mode-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mode-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background-color: var(--bg-secondary);
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font-family: inherit;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.mode-card:hover:not(:disabled) {
+  border-color: var(--accent-light);
+}
+
+.mode-card.selected {
+  border-color: var(--accent);
+  background-color: var(--accent-glow);
+}
+
+.mode-card:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.mode-card-icon {
+  color: var(--accent);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.mode-card-title {
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.mode-card-desc {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  line-height: 1.5;
 }
 
 /* App Footer */

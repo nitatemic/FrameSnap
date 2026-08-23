@@ -20,7 +20,10 @@ import {
   AlertTriangle,
   CheckCircle2,
   Loader2,
-  ExternalLink
+  ExternalLink,
+  Zap,
+  Crosshair,
+  Gauge
 } from 'lucide-react';
 import './App.css';
 
@@ -49,30 +52,67 @@ function formatTimestamp(sec) {
   return `${pad(m)}:${pad(s)}.${pad(ms, 3)}`;
 }
 
-// Visual Fingerprint generation via tiny Canvas
-function getVisualFingerprint(imgUrl) {
+// Visual Fingerprint + sharpness analysis (single image decode)
+function analyzeFrameImage(imgUrl) {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.src = imgUrl;
     img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = 16;
-      canvas.height = 16;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(img, 0, 0, 16, 16);
+      const result = { fingerprint: null, sharpness: 0 };
+
+      const fpCanvas = document.createElement('canvas');
+      fpCanvas.width = 16;
+      fpCanvas.height = 16;
+      const fpCtx = fpCanvas.getContext('2d', { willReadFrequently: true });
+      if (fpCtx) {
+        fpCtx.drawImage(img, 0, 0, 16, 16);
         try {
-          const imgData = ctx.getImageData(0, 0, 16, 16).data;
-          resolve(imgData);
-        } catch (e) {
-          resolve(null);
+          result.fingerprint = fpCtx.getImageData(0, 0, 16, 16).data;
+        } catch {
+          result.fingerprint = null;
         }
-      } else {
-        resolve(null);
       }
+
+      const sW = 160;
+      const ratio = img.naturalHeight / (img.naturalWidth || 1);
+      const sH = Math.max(2, Math.round(ratio * sW) || 90);
+      const sCanvas = document.createElement('canvas');
+      sCanvas.width = sW;
+      sCanvas.height = sH;
+      const sCtx = sCanvas.getContext('2d', { willReadFrequently: true });
+      if (sCtx) {
+        sCtx.drawImage(img, 0, 0, sW, sH);
+        try {
+          const data = sCtx.getImageData(0, 0, sW, sH).data;
+          const gray = new Float64Array(sW * sH);
+          for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+            gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          }
+          let sumLap = 0;
+          let sumLapSq = 0;
+          let count = 0;
+          for (let y = 1; y < sH - 1; y++) {
+            for (let x = 1; x < sW - 1; x++) {
+              const idx = y * sW + x;
+              const lap = 4 * gray[idx] - gray[idx - 1] - gray[idx + 1] - gray[idx - sW] - gray[idx + sW];
+              sumLap += lap;
+              sumLapSq += lap * lap;
+              count++;
+            }
+          }
+          if (count > 0) {
+            const mean = sumLap / count;
+            result.sharpness = sumLapSq / count - mean * mean;
+          }
+        } catch {
+          result.sharpness = 0;
+        }
+      }
+
+      resolve(result);
     };
-    img.onerror = () => resolve(null);
+    img.onerror = () => resolve({ fingerprint: null, sharpness: 0 });
   });
 }
 
@@ -92,6 +132,51 @@ function calculateDifference(fp1, fp2) {
   return (rms / 255) * 100; // Returns 0% to 100%
 }
 
+const FAST_CHUNK_THRESHOLD_S = 120;
+const THUMBNAIL_WINDOW_S = 2;
+const MAX_UNBOUNDED_SEGMENTS = 500;
+
+function parseFpsFromLogs(logs) {
+  const videoLines = logs.filter(l => l.includes('Stream #') && l.includes('Video:'));
+  for (const line of videoLines) {
+    const m = line.match(/(\d+(?:\.\d+)?)\s*fps/i);
+    if (m) return parseFloat(m[1]);
+  }
+  for (const line of videoLines) {
+    const m = line.match(/(\d+(?:\.\d+)?)\s*tbr/i);
+    if (m) return parseFloat(m[1]);
+  }
+  return null;
+}
+
+function parseDurationFromLogs(logs) {
+  for (const line of logs) {
+    const m = line.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if (m) {
+      return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+    }
+  }
+  return null;
+}
+
+function parseShowinfoLogs(logs) {
+  const infoMap = new Map();
+  for (const log of logs) {
+    if (!log.includes('Parsed_showinfo')) continue;
+    const nMatch = log.match(/n:\s*(\d+)/);
+    const ptsMatch = log.match(/pts_time:\s*([\d.e+-]+)/);
+    const resMatch = log.match(/s:\s*(\d+x\d+)/);
+
+    if (nMatch) {
+      infoMap.set(parseInt(nMatch[1], 10), {
+        timestamp: ptsMatch ? parseFloat(ptsMatch[1]) : null,
+        resolution: resMatch ? resMatch[1] : null
+      });
+    }
+  }
+  return infoMap;
+}
+
 function App() {
   // App States
   const [theme, setTheme] = useState('dark');
@@ -101,19 +186,20 @@ function App() {
   const [videoFile, setVideoFile] = useState(null);
   const [videoUrl, setVideoUrl] = useState(null);
   const [videoMeta, setVideoMeta] = useState(null);
+  const [videoFps, setVideoFps] = useState(null);
   const [rawFrames, setRawFrames] = useState([]);
   const [selectedFrame, setSelectedFrame] = useState(null);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [segmentInfo, setSegmentInfo] = useState(null);
   const [statusSteps, setStatusSteps] = useState([]);
   const [errorMessage, setErrorMessage] = useState(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [galleryFilter, setGalleryFilter] = useState('all'); // all, unique, duplicates
-  
-  // API Mode States
-  const [useApiMode, setUseApiMode] = useState(false);
-  const [apiUrl, setApiUrl] = useState('http://localhost:8080/api/extract');
-  const [apiToken, setApiToken] = useState('');
+
+  // Extraction Strategy States
+  const [extractMode, setExtractMode] = useState('fast'); // fast, detailed
+  const [segmentSeconds, setSegmentSeconds] = useState(10);
 
   // Advanced Settings States
   const [extractionLimit, setExtractionLimit] = useState(30);
@@ -122,12 +208,12 @@ function App() {
   const [scaleResolution, setScaleResolution] = useState('original');
   const [dedupEnabled, setDedupEnabled] = useState(true);
   const [dedupThreshold, setDedupThreshold] = useState(4.0); // 4% difference
-  const [extractionMethod, setExtractionMethod] = useState('combined'); // combined, fast, precise
-  const [sortOrder, setSortOrder] = useState('chrono'); // chrono, size
+  const [sortOrder, setSortOrder] = useState('chrono'); // chrono, size, sharpness
 
   // Refs
   const ffmpegInstance = useRef(null);
   const ffmpegLogsRef = useRef([]);
+  const progressCtxRef = useRef({ type: 'single', done: 0, total: 0 });
   const dropZoneRef = useRef(null);
   const [dragActive, setDragActive] = useState(false);
 
@@ -162,10 +248,12 @@ function App() {
     cleanupUrls();
     setVideoFile(null);
     setVideoMeta(null);
+    setVideoFps(null);
     setRawFrames([]);
     setSelectedFrame(null);
     setErrorMessage(null);
     setProgress(0);
+    setSegmentInfo(null);
   };
 
   // File loading helper
@@ -239,9 +327,15 @@ function App() {
         ffmpegLogsRef.current.push(message);
       });
       
-      // Hook progress
+      // Hook progress (blended with chunk context when processing segments)
       ffmpeg.on('progress', ({ progress }) => {
-        setProgress(Math.round(progress * 100));
+        const ctx = progressCtxRef.current;
+        if (ctx.type === 'chunk' && ctx.total > 0) {
+          const clamped = Math.min(Math.max(progress, 0), 1);
+          setProgress(Math.round(((ctx.done + clamped) / ctx.total) * 100));
+        } else {
+          setProgress(Math.round(progress * 100));
+        }
       });
       
       const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
@@ -274,12 +368,14 @@ function App() {
     setErrorMessage(null);
     
     ffmpegLogsRef.current = [];
-    
+    progressCtxRef.current = { type: 'single', done: 0, total: 0 };
+
     const steps = [
       { id: 'load', name: 'Initialisation de FFmpeg.wasm', status: 'active' },
       { id: 'write', name: 'Copie de la vidéo dans le stockage WASM', status: 'pending' },
-      { id: 'exec', name: 'Extraction des I-frames (FFmpeg)', status: 'pending' },
-      { id: 'read', name: 'Traitement des images générées', status: 'pending' },
+      { id: 'probe', name: 'Analyse des métadonnées (framerate, durée)', status: 'pending' },
+      { id: 'exec', name: "Extraction des images nettes (filtre thumbnail)", status: 'pending' },
+      { id: 'read', name: 'Récupération et purge mémoire', status: 'pending' },
       { id: 'dedup', name: 'Analyse et déduplication visuelle', status: 'pending' }
     ];
     setStatusSteps(steps);
@@ -289,98 +385,6 @@ function App() {
     };
 
     try {
-      if (useApiMode) {
-        // API Extraction branch
-        updateStep('load', 'completed');
-        updateStep('write', 'completed');
-        updateStep('exec', 'active');
-        
-        const formData = new FormData();
-        formData.append('video', videoFile);
-        formData.append('mode', 'gallery');
-        formData.append('method', extractionMethod);
-        formData.append('limit', String(extractionLimit));
-        formData.append('scale', scaleResolution);
-        formData.append('format', exportFormat);
-        formData.append('quality', String(exportQuality));
-
-        const headers = {};
-        if (apiToken) {
-          headers['Authorization'] = `Bearer ${apiToken}`;
-        }
-
-        const response = await fetch(apiUrl, {
-          method: 'POST',
-          headers,
-          body: formData
-        });
-
-        if (!response.ok) {
-          throw new Error(`Erreur API: ${response.status} ${response.statusText}`);
-        }
-
-        const blob = await response.blob();
-        
-        updateStep('exec', 'completed');
-        updateStep('read', 'active');
-        
-        const JSZip = (await import('jszip')).default;
-        const zip = await JSZip.loadAsync(blob);
-        
-        let i = 1;
-        const loadedFrames = [];
-        
-        for (const [filename, fileData] of Object.entries(zip.files)) {
-          if (!fileData.dir) {
-            const data = await fileData.async('uint8array');
-            const mimeType = exportFormat === 'png' ? 'image/png' : 'image/jpeg';
-            const imgBlob = new Blob([data.buffer], { type: mimeType });
-            const url = URL.createObjectURL(imgBlob);
-            
-            loadedFrames.push({
-              id: i,
-              name: filename,
-              url,
-              blob: imgBlob,
-              size: data.length,
-              timestamp: i, // Fallback timestamp since API doesn't parse it yet
-              resolution: videoMeta ? videoMeta.resolution : 'Originale',
-              isDuplicate: false,
-              duplicateOf: null,
-              difference: 0
-            });
-            i++;
-          }
-        }
-        
-        updateStep('read', 'completed');
-        updateStep('dedup', 'active');
-        
-        if (loadedFrames.length === 0) {
-          setErrorMessage("L'API n'a renvoyé aucune image. Vérifiez les options d'extraction.");
-          setProcessing(false);
-          updateStep('dedup', 'error');
-          return;
-        }
-        
-        // Compute visual similarity fingerprints
-        const framesWithFingerprints = [];
-        for (let fIdx = 0; fIdx < loadedFrames.length; fIdx++) {
-          const frame = loadedFrames[fIdx];
-          setProgress(Math.round((fIdx / loadedFrames.length) * 100));
-          const fingerprint = await getVisualFingerprint(frame.url);
-          framesWithFingerprints.push({
-            ...frame,
-            fingerprint
-          });
-        }
-        
-        setRawFrames(framesWithFingerprints);
-        updateStep('dedup', 'completed');
-        setProcessing(false);
-        return;
-      }
-
       // Step 1: Init Engine
       let ffmpeg = ffmpegInstance.current;
       if (!ffmpegLoaded || !ffmpeg) {
@@ -389,147 +393,190 @@ function App() {
       updateStep('load', 'completed');
       updateStep('write', 'active');
       
-      // Step 2: Write local file to WASM FS
       const fileData = await fetchFile(videoFile);
       await ffmpeg.writeFile('input.mp4', fileData);
       updateStep('write', 'completed');
+      updateStep('probe', 'active');
+
+      try {
+        await ffmpeg.exec(['-i', 'input.mp4']);
+      } catch (probeErr) {
+        console.warn(probeErr);
+      }
+
+      const probedFps = parseFpsFromLogs(ffmpegLogsRef.current);
+      const probedDuration = parseDurationFromLogs(ffmpegLogsRef.current);
+      setVideoFps(probedFps);
+      updateStep('probe', 'completed');
       updateStep('exec', 'active');
-      
-      // Step 3: Configure and execute commands
+
+      const safeFps = probedFps && probedFps > 0 ? probedFps : 30;
+      const duration = videoMeta && Number.isFinite(videoMeta.duration) && videoMeta.duration > 0
+        ? videoMeta.duration
+        : probedDuration;
+      const isDetailed = extractMode === 'detailed';
+      const needsChunking = isDetailed || (duration !== null && duration > FAST_CHUNK_THRESHOLD_S);
+      const thumbnailBatch = isDetailed
+        ? Math.min(90, Math.max(8, Math.round(safeFps * THUMBNAIL_WINDOW_S)))
+        : 2;
+
       const filters = [];
-      if (extractionMethod === 'precise' || extractionMethod === 'combined') {
-        filters.push("select='eq(pict_type,I)'");
-      }
+      if (!isDetailed) filters.push('fps=1');
       if (scaleResolution === 'half') {
-        filters.push("scale=iw/2:-2");
+        filters.push('scale=iw/2:-2');
       } else if (scaleResolution === 'quarter') {
-        filters.push("scale=iw/4:-2");
+        filters.push('scale=iw/4:-2');
       }
-      filters.push("showinfo");
-      
+      filters.push(`thumbnail=${thumbnailBatch}`);
+      filters.push('showinfo');
       const filterGraph = filters.join(',');
-      const args = [];
-      
-      // Fast mode ignores non-keyframes at decoder level
-      if (extractionMethod === 'fast' || extractionMethod === 'combined') {
-        args.push('-skip_frame', 'nokey');
-      }
-      
-      args.push('-i', 'input.mp4');
-      
-      if (filters.length > 0) {
-        args.push('-vf', filterGraph);
-      }
-      
-      args.push('-an'); // remove audio track to speed up
-      
-      if (extractionLimit > 0) {
-        args.push('-vframes', String(extractionLimit));
-      }
-      
-      args.push('-vsync', 'vfr');
-      
+
       const outExt = exportFormat === 'png' ? 'png' : 'jpg';
-      if (exportFormat === 'jpeg') {
-        const qscale = Math.round(31 - (exportQuality * 29)); // maps 0.1-1.0 to 31-2
-        args.push('-q:v', String(qscale));
-      }
-      args.push(`out_%d.${outExt}`);
-      
-      await ffmpeg.exec(args);
-      
-      updateStep('exec', 'completed');
-      updateStep('read', 'active');
-      
-      // Parse showinfo logs for precise metadata
-      const infoMap = new Map();
-      const logs = ffmpegLogsRef.current;
-      for (const log of logs) {
-        if (log.includes('Parsed_showinfo')) {
-          const nMatch = log.match(/n:\s*(\d+)/);
-          const ptsMatch = log.match(/pts_time:\s*([\d.e-]+)/);
-          const resMatch = log.match(/s:\s*(\d+x\d+)/);
-          
-          if (nMatch) {
-            const idx = parseInt(nMatch[1], 10);
-            infoMap.set(idx, {
-              timestamp: ptsMatch ? parseFloat(ptsMatch[1]) : null,
-              resolution: resMatch ? resMatch[1] : null
-            });
+      const qualityArgs = exportFormat === 'jpeg'
+        ? ['-q:v', String(Math.round(31 - (exportQuality * 29)))]
+        : [];
+      let runningId = 1;
+
+      const readSegmentFrames = async ({ timeOffset, infoMap }) => {
+        const frames = [];
+        let idx = 1;
+        while (true) {
+          const filename = `out_${idx}.${outExt}`;
+          let data;
+          try {
+            data = await ffmpeg.readFile(filename);
+          } catch {
+            break;
           }
-        }
-      }
-      
-      // Step 4: Retrieve images from WASM virtual directory
-      let i = 1;
-      const loadedFrames = [];
-      while (true) {
-        const filename = `out_${i}.${outExt}`;
-        try {
-          const data = await ffmpeg.readFile(filename);
+
           const mimeType = exportFormat === 'png' ? 'image/png' : 'image/jpeg';
           const blob = new Blob([data.buffer], { type: mimeType });
           const url = URL.createObjectURL(blob);
-          
-          const metadata = infoMap.get(i - 1) || {};
-          
-          loadedFrames.push({
-            id: i,
+          const metadata = infoMap.get(idx - 1) || {};
+
+          frames.push({
+            id: runningId++,
             name: filename,
             url,
             blob,
             size: data.length,
-            timestamp: metadata.timestamp !== undefined && !isNaN(metadata.timestamp) ? metadata.timestamp : (i - 1),
+            timestamp: typeof metadata.timestamp === 'number' && !isNaN(metadata.timestamp)
+              ? timeOffset + metadata.timestamp
+              : (timeOffset || idx - 1),
             resolution: metadata.resolution || (videoMeta ? videoMeta.resolution : 'Originale'),
             isDuplicate: false,
             duplicateOf: null,
             difference: 0
           });
-          
-          // Delete file to free memory in virtual FS
+
           await ffmpeg.deleteFile(filename);
-          i++;
-        } catch (e) {
-          // No more files
-          break;
+          idx++;
         }
+        return frames;
+      };
+
+      let loadedFrames = [];
+
+      if (!needsChunking) {
+        const logStart = ffmpegLogsRef.current.length;
+        const args = ['-i', 'input.mp4', '-vf', filterGraph, '-an', ...qualityArgs];
+        if (extractionLimit > 0) {
+          args.push('-vframes', String(extractionLimit));
+        }
+        args.push('-vsync', 'vfr', `out_%d.${outExt}`);
+
+        await ffmpeg.exec(args);
+
+        const infoMap = parseShowinfoLogs(ffmpegLogsRef.current.slice(logStart));
+        updateStep('exec', 'completed');
+        updateStep('read', 'active');
+        loadedFrames = await readSegmentFrames({ timeOffset: 0, infoMap });
+      } else {
+        const totalSegs = duration !== null ? Math.max(1, Math.ceil(duration / segmentSeconds)) : null;
+        let start = 0;
+        let segIndex = 0;
+        progressCtxRef.current = { type: 'chunk', done: 0, total: totalSegs || MAX_UNBOUNDED_SEGMENTS };
+
+        while (true) {
+          const remaining = duration !== null ? duration - start : Infinity;
+          if (remaining <= 0.05) break;
+          if (totalSegs === null && segIndex >= MAX_UNBOUNDED_SEGMENTS) break;
+          if (extractionLimit > 0 && loadedFrames.length >= extractionLimit) break;
+
+          const segDur = Math.min(segmentSeconds, remaining);
+          setSegmentInfo({ index: segIndex + 1, total: totalSegs });
+
+          const logStart = ffmpegLogsRef.current.length;
+          const args = ['-ss', start.toFixed(3), '-i', 'input.mp4', '-t', segDur.toFixed(3)];
+          if (extractionLimit > 0) {
+            args.push('-vframes', String(extractionLimit - loadedFrames.length));
+          }
+          args.push('-vf', filterGraph, '-an', ...qualityArgs, '-vsync', 'vfr', `out_%d.${outExt}`);
+
+          await ffmpeg.exec(args);
+
+          const infoMap = parseShowinfoLogs(ffmpegLogsRef.current.slice(logStart));
+          updateStep('read', 'active');
+          const segFrames = await readSegmentFrames({ timeOffset: start, infoMap });
+          loadedFrames = loadedFrames.concat(segFrames);
+
+          segIndex += 1;
+          start += segmentSeconds;
+          progressCtxRef.current = { type: 'chunk', done: segIndex, total: totalSegs || MAX_UNBOUNDED_SEGMENTS };
+          setProgress(totalSegs ? Math.round((segIndex / totalSegs) * 100) : 95);
+
+          if (segFrames.length === 0) break;
+          if (extractionLimit > 0 && loadedFrames.length >= extractionLimit) break;
+        }
+
+        progressCtxRef.current = { type: 'single', done: 0, total: 0 };
+        updateStep('exec', 'completed');
       }
       
-      // Clean up input video file
       try {
         await ffmpeg.deleteFile('input.mp4');
       } catch (e) {
         console.warn(e);
       }
-      
+
       updateStep('read', 'completed');
       updateStep('dedup', 'active');
-      
+
       if (loadedFrames.length === 0) {
-        setErrorMessage("FFmpeg a terminé l'analyse mais aucune I-frame n'a été générée. La vidéo contient peut-être un format d'indexation exotique ou aucun point clé n'a été détecté.");
+        setErrorMessage("FFmpeg a terminé l'analyse mais aucune image nette n'a pu être extraite. Essayez le Mode Détaillé ou vérifiez que le fichier contient une piste vidéo exploitable.");
         setProcessing(false);
         updateStep('dedup', 'error');
         return;
       }
+
+      setSegmentInfo(null);
       
-      // Step 5: Compute visual similarity fingerprints
-      const framesWithFingerprints = [];
+      // Step 5: Compute visual similarity fingerprints + sharpness scores
+      const framesWithAnalysis = [];
       for (let fIdx = 0; fIdx < loadedFrames.length; fIdx++) {
         const frame = loadedFrames[fIdx];
         setProgress(Math.round((fIdx / loadedFrames.length) * 100));
-        const fingerprint = await getVisualFingerprint(frame.url);
-        framesWithFingerprints.push({
+        const analysis = await analyzeFrameImage(frame.url);
+        framesWithAnalysis.push({
           ...frame,
-          fingerprint
+          fingerprint: analysis.fingerprint,
+          sharpness: analysis.sharpness
         });
       }
-      
-      setRawFrames(framesWithFingerprints);
+
+      setRawFrames(framesWithAnalysis);
       updateStep('dedup', 'completed');
       setProcessing(false);
       
     } catch (err) {
       console.error(err);
+      try {
+        if (ffmpegInstance.current) {
+          await ffmpegInstance.current.deleteFile('input.mp4');
+        }
+      } catch (cleanupErr) {
+        console.warn(cleanupErr);
+      }
       setErrorMessage("Une erreur est survenue lors du traitement de la vidéo : " + err.message);
       setProcessing(false);
       setStatusSteps(prev => prev.map(s => s.status === 'active' || s.status === 'pending' ? { ...s, status: 'error' } : s));
@@ -570,6 +617,9 @@ function App() {
     // Sort logic
     if (sortOrder === 'size') {
       return updated.sort((a, b) => b.size - a.size);
+    }
+    if (sortOrder === 'sharpness') {
+      return updated.sort((a, b) => (b.sharpness || 0) - (a.sharpness || 0));
     }
     return updated.sort((a, b) => a.timestamp - b.timestamp);
   }, [rawFrames, dedupEnabled, dedupThreshold, sortOrder]);
@@ -622,6 +672,10 @@ function App() {
     }
     return bestFrame;
   }, [processedFrames]);
+
+  const videoAspectRatio = videoMeta && videoMeta.height > 0
+    ? `${videoMeta.width} / ${videoMeta.height}`
+    : '16 / 9';
 
   // Automatically select recommended or first frame once extraction completes
   useEffect(() => {
@@ -734,7 +788,7 @@ function App() {
               </div>
             ) : (
               <div className="animate-fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <div className="video-preview-card">
+                <div className="video-preview-card" style={{ aspectRatio: videoAspectRatio }}>
                   <video src={videoUrl} controls muted playsInline />
                 </div>
                 
@@ -753,6 +807,12 @@ function App() {
                         <span style={{ fontWeight: '600' }}>Résolution :</span>
                         <span>{videoMeta.resolution}</span>
                       </div>
+                      {videoFps !== null && (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--border)', paddingBottom: '4px' }}>
+                          <span style={{ fontWeight: '600' }}>Cadence :</span>
+                          <span>{videoFps.toFixed(2)} fps</span>
+                        </div>
+                      )}
                       <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--border)', paddingBottom: '4px' }}>
                         <span style={{ fontWeight: '600' }}>Durée :</span>
                         <span>{videoMeta.duration.toFixed(2)} secondes</span>
@@ -766,7 +826,7 @@ function App() {
                     <AlertTriangle className="status-banner-icon" size={14} />
                     <div className="status-banner-content">
                       <div className="status-banner-title">Vidéo volumineuse</div>
-                      <div className="status-banner-desc">FFmpeg.wasm pourrait saturer la mémoire. Activez le mode <strong>Combiné</strong> ou <strong>Ultra Rapide</strong>.</div>
+                      <div className="status-banner-desc">FFmpeg.wasm pourrait saturer la mémoire. Privilégiez le <strong>Mode Rapide</strong> ou réduisez la limite d'images.</div>
                     </div>
                   </div>
                 )}
@@ -796,6 +856,44 @@ function App() {
             )}
           </div>
 
+          {/* Extraction Mode Panel */}
+          <div className="panel">
+            <div className="panel-title">
+              <Gauge size={18} />
+              Mode d'extraction
+            </div>
+            <div className="mode-selector">
+              <button
+                type="button"
+                className={`mode-card ${extractMode === 'fast' ? 'selected' : ''}`}
+                onClick={() => setExtractMode('fast')}
+                disabled={processing}
+              >
+                <Zap className="mode-card-icon" size={20} />
+                <div>
+                  <div className="mode-card-title">Rapide</div>
+                  <div className="mode-card-desc">
+                    Échantillonne environ 1 image par seconde et garde la plus nette par petits lots. Traitement en une passe sur les vidéos courtes.
+                  </div>
+                </div>
+              </button>
+              <button
+                type="button"
+                className={`mode-card ${extractMode === 'detailed' ? 'selected' : ''}`}
+                onClick={() => setExtractMode('detailed')}
+                disabled={processing}
+              >
+                <Crosshair className="mode-card-icon" size={20} />
+                <div>
+                  <div className="mode-card-title">Détaillé</div>
+                  <div className="mode-card-desc">
+                    Analyse environ {THUMBNAIL_WINDOW_S} secondes de vidéo par image retenue, adapté au framerate réel et traité par segments pour préserver la mémoire.
+                  </div>
+                </div>
+              </button>
+            </div>
+          </div>
+
           {/* Advanced Panel */}
           <div className="panel">
             <button
@@ -813,63 +911,25 @@ function App() {
             {advancedOpen && (
               <div className="animate-fade-in" style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 
-                {/* API Mode Toggle */}
-                <div className="form-group" style={{ backgroundColor: 'var(--bg-secondary)', padding: '12px', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
-                  <label className="form-checkbox-label" style={{ fontWeight: '600', marginBottom: useApiMode ? '12px' : '0' }}>
-                    <input
-                      type="checkbox"
-                      className="form-checkbox"
-                      checked={useApiMode}
-                      onChange={(e) => setUseApiMode(e.target.checked)}
-                      disabled={processing}
-                    />
-                    Utiliser l'API Distante (Docker)
-                  </label>
-                  
-                  {useApiMode && (
-                    <div className="animate-fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <div className="form-group" style={{ marginBottom: '0' }}>
-                        <label className="form-label" style={{ fontSize: '0.75rem' }}>URL de l'API</label>
-                        <input
-                          type="text"
-                          className="form-select"
-                          value={apiUrl}
-                          onChange={(e) => setApiUrl(e.target.value)}
-                          disabled={processing}
-                          placeholder="http://localhost:8080/api/extract"
-                        />
-                      </div>
-                      <div className="form-group" style={{ marginBottom: '0' }}>
-                        <label className="form-label" style={{ fontSize: '0.75rem' }}>Jeton d'authentification (Optionnel)</label>
-                        <input
-                          type="password"
-                          className="form-select"
-                          value={apiToken}
-                          onChange={(e) => setApiToken(e.target.value)}
-                          disabled={processing}
-                          placeholder="Votre API_SECRET_TOKEN"
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* Method */}
+                {/* Chunk size */}
                 <div className="form-group">
                   <label className="form-label">
-                    Méthode d'extraction
-                    <span className="form-label-badge">{extractionMethod}</span>
+                    Taille des segments
+                    <span className="form-label-badge">{segmentSeconds} s</span>
                   </label>
-                  <select
-                    className="form-select"
-                    value={extractionMethod}
-                    onChange={(e) => setExtractionMethod(e.target.value)}
+                  <input
+                    type="range"
+                    className="form-range"
+                    min="5"
+                    max="15"
+                    step="1"
+                    value={segmentSeconds}
+                    onChange={(e) => setSegmentSeconds(Number(e.target.value))}
                     disabled={processing}
-                  >
-                    <option value="combined">Combinée (Recommandée)</option>
-                    <option value="fast">Ultra Rapide (Décodage partiel)</option>
-                    <option value="precise">Précise (Décodage complet)</option>
-                  </select>
+                  />
+                  <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                    Durée traitée par passe FFmpeg en Mode Détaillé (et sur les vidéos de plus de {FAST_CHUNK_THRESHOLD_S} secondes).
+                  </div>
                 </div>
 
                 {/* Limit */}
@@ -889,7 +949,7 @@ function App() {
                     disabled={processing}
                   />
                   <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
-                    0 = extraire toutes les I-frames (lent sur longues vidéos).
+                    0 = extraire toutes les images détectées (lent sur longues vidéos).
                   </div>
                 </div>
 
@@ -994,6 +1054,7 @@ function App() {
                   >
                     <option value="chrono">Chronologique (Temps)</option>
                     <option value="size">Poids de l'image (Détails)</option>
+                    <option value="sharpness">Netteté (Score d'analyse)</option>
                   </select>
                 </div>
 
@@ -1005,14 +1066,14 @@ function App() {
           <div className="panel help-panel">
             <div className="panel-title" style={{ fontSize: '0.9rem' }}>
               <HelpCircle size={16} />
-              Pourquoi de vraies I-frames ?
+              Pourquoi ces images sont plus nettes ?
             </div>
             <div className="help-text">
               <p>
-                Contrairement aux outils de capture HTML5 qui capturent de simples frames décodées au hasard, <strong>FrameSnap</strong> interroge la structure physique du fichier vidéo.
+                Plutôt que de capturer une frame au hasard, <strong>FrameSnap</strong> utilise le filtre <code>thumbnail</code> de FFmpeg : il compare toutes les frames d'une fenêtre temporelle et ne conserve que la plus représentative, en privilégiant les zones nettes et détaillées (moins de flou de mouvement).
               </p>
               <p>
-                En utilisant <code>FFmpeg.wasm</code> avec le filtre <code>select='eq(pict_type,I)'</code> et <code>-skip_frame nokey</code>, l'application isole et extrait les <strong>I-frames (keyframes)</strong> d'origine, c'est-à-dire les seules images complètes stockées par le compresseur sans dépendance temporelle.
+                Le <strong>Mode Rapide</strong> échantillonne à 1 fps puis compare par petits lots. Le <strong>Mode Détaillé</strong> adapte automatiquement la taille des lots au framerate réel de votre vidéo (détecté via FFmpeg) et traite le fichier par segments, avec purge de la mémoire virtuelle après chaque passe pour éviter tout plantage.
               </p>
               <p>
                 <em>Traitement 100% local : aucun fichier n'est envoyé sur un serveur.</em>
@@ -1031,9 +1092,9 @@ function App() {
               <div style={{ backgroundColor: 'var(--accent-glow)', padding: '16px', borderRadius: 'var(--radius-full)', color: 'var(--accent)', marginBottom: '16px', animation: 'pulse-glow 2s infinite' }}>
                 <Video size={40} />
               </div>
-              <h2 style={{ fontSize: '1.5rem', fontWeight: '800', marginBottom: '8px' }}>Prêt à capturer vos Keyframes</h2>
+              <h2 style={{ fontSize: '1.5rem', fontWeight: '800', marginBottom: '8px' }}>Prêt à capturer vos meilleures images</h2>
               <p style={{ color: 'var(--text-secondary)', maxWidth: '420px', fontSize: '0.9rem', marginBottom: '24px' }}>
-                Importez une vidéo locale pour extraire et isoler de vraies I-frames à l'aide de FFmpeg WebAssembly directement dans votre navigateur.
+                Importez une vidéo locale pour extraire automatiquement les images les plus nettes grâce au filtre thumbnail de FFmpeg WebAssembly, directement dans votre navigateur.
               </p>
               <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                 <CheckCircle2 size={14} className="text-success" style={{ color: 'var(--success)' }} /> 100% local
@@ -1051,10 +1112,16 @@ function App() {
               <div style={{ position: 'relative', width: '64px', height: '64px', display: 'flex', alignItems: 'center', justifyContents: 'center', marginBottom: '16px' }}>
                 <Loader2 className="animate-spin" size={48} style={{ color: 'var(--accent)' }} />
               </div>
-              <h2 style={{ fontSize: '1.25rem', fontWeight: '700', marginBottom: '4px' }}>Extraction des I-frames en cours...</h2>
+              <h2 style={{ fontSize: '1.25rem', fontWeight: '700', marginBottom: '4px' }}>Extraction des images nettes en cours...</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
                 Cette opération s'exécute localement et peut prendre quelques secondes.
               </p>
+
+              {segmentInfo && (
+                <p className="animate-fade-in" style={{ color: 'var(--accent)', fontWeight: '700', fontSize: '0.9rem', margin: '8px 0 0' }}>
+                  Segment {segmentInfo.index}{segmentInfo.total ? ` / ${segmentInfo.total}` : ''}
+                </p>
+              )}
               
               <div className="progress-bar-container">
                 <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
@@ -1098,7 +1165,7 @@ function App() {
                   
                   <div className="preview-panel">
                     {/* Frame Viewport */}
-                    <div className="preview-viewport">
+                    <div className="preview-viewport" style={{ aspectRatio: videoAspectRatio, maxHeight: '70vh' }}>
                       <img src={selectedFrame.url} alt={`Frame ${selectedFrame.id}`} />
                     </div>
                     
@@ -1120,6 +1187,10 @@ function App() {
                         <div className="metadata-item">
                           <span className="metadata-label">Poids exporté</span>
                           <span className="metadata-value">{formatBytes(selectedFrame.size)}</span>
+                        </div>
+                        <div className="metadata-item">
+                          <span className="metadata-label">Score de netteté</span>
+                          <span className="metadata-value">{Math.round(selectedFrame.sharpness || 0)}</span>
                         </div>
                         {selectedFrame.isDuplicate && (
                           <div className="metadata-item" style={{ borderBottom: 'none' }}>
@@ -1157,7 +1228,7 @@ function App() {
                 <div className="gallery-header">
                   <div className="panel-title" style={{ margin: '0' }}>
                     <Layers size={18} />
-                    Galerie des I-Frames
+                    Galerie d'images nettes
                     <span className="gallery-stats">
                       ({uniqueCount} unique{uniqueCount > 1 ? 's' : ''} {dedupEnabled && `+ ${duplicateCount} doublon${duplicateCount > 1 ? 's' : ''}`})
                     </span>
@@ -1249,7 +1320,7 @@ function App() {
 
       {/* Footer */}
       <footer className="app-footer">
-        <p>© 2026 FrameSnap • Outil d'extraction professionnel d'I-frames localisé.</p>
+        <p>© 2026 FrameSnap • Outil d'extraction professionnel d'images nettes, 100% localisé.</p>
         <p style={{ color: 'var(--text-muted)' }}>
           Propulsé par FFmpeg.wasm et WebAssembly dans le navigateur.
         </p>
